@@ -11,42 +11,51 @@ export function makeUUID() {
   return uuid
 }
 
-export const loadScript = (
-  FILE_URL,
-  async = true,
-  type = 'text/javascript',
-) => {
-  return new Promise((resolve, reject) => {
-    try {
-      // Check if the script already exists
-      const existingScript = document.querySelector(`script[src="${FILE_URL}"]`)
-      if (existingScript) {
-        resolve({ status: true, message: 'Script already loaded' })
-        return
-      }
+// export const loadScript = (
+//   FILE_URL,
+//   async = true,
+//   type = 'text/javascript',
+// ) => {
+//   return new Promise((resolve, reject) => {
+//     try {
+//       // Check if the script already exists
+//       const existingScript = document.querySelector(`script[src="${FILE_URL}"]`)
+//       if (existingScript) {
+//         resolve({ status: true, message: 'Script already loaded' })
+//         return
+//       }
 
-      const scriptEle = document.createElement('script')
-      scriptEle.type = type
-      scriptEle.async = async
-      scriptEle.src = FILE_URL
+//       const scriptEle = document.createElement('script')
+//       scriptEle.type = type
+//       scriptEle.async = async
+//       scriptEle.src = FILE_URL
 
-      scriptEle.addEventListener('load', (ev) => {
-        resolve({ status: true })
-      })
+//       scriptEle.addEventListener('load', (ev) => {
+//         resolve({ status: true })
+//       })
 
-      scriptEle.addEventListener('error', (ev) => {
-        reject({
-          status: false,
-          message: `Failed to load the script ${FILE_URL}`,
-        })
-      })
+//       scriptEle.addEventListener('error', (ev) => {
+//         reject({
+//           status: false,
+//           message: `Failed to load the script ${FILE_URL}`,
+//         })
+//       })
 
-      document.body.appendChild(scriptEle)
-    } catch (error) {
-      reject(error)
-    }
-  })
-}
+//       document.body.appendChild(scriptEle)
+//     } catch (error) {
+//       reject(error)
+//     }
+//   })
+// }
+
+export const loadScript = async (FILE_URL) => {
+  try {
+    await import(FILE_URL);
+  } catch (error) {
+    console.error(`Failed to load the script ${FILE_URL}`, error);
+  }
+};
+
 const create_documentation_stylesheet = () => {
   const tag = 'kj-pointseditor-stylesheet'
 

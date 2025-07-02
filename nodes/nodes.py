@@ -1,13 +1,16 @@
 import torch
+import torch.nn as nn
 import numpy as np
 from PIL import Image
-
-import json, re, os, io, time
+from typing import Union
+import json, re, os, io, time, platform
+import re
 import importlib
-import model_management
+
+from comfy import model_management
 import folder_paths
 from nodes import MAX_RESOLUTION
-from comfy.utils import common_upscale, ProgressBar
+from comfy.utils import common_upscale, ProgressBar, load_torch_file
 
 script_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 folder_paths.add_model_folder_path("kjnodes_fonts", os.path.join(script_directory, "fonts"))
@@ -19,11 +22,26 @@ class AnyType(str):
     return False
 any = AnyType("*")
 
+class BOOLConstant:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "value": ("BOOLEAN", {"default": True}),
+        },
+        }
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "get_value"
+    CATEGORY = "KJNodes/constants"
+
+    def get_value(self, value):
+        return (value,)
+    
 class INTConstant:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "value": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            "value": ("INT", {"default": 0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff}),
         },
         }
     RETURN_TYPES = ("INT",)
@@ -38,7 +56,7 @@ class FloatConstant:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "value": ("FLOAT", {"default": 0.0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff, "step": 0.001}),
+            "value": ("FLOAT", {"default": 0.0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff, "step": 0.00001}),
         },
         }
 
@@ -48,7 +66,7 @@ class FloatConstant:
     CATEGORY = "KJNodes/constants"
 
     def get_value(self, value):
-        return (value,)
+        return (round(value, 6),)
 
 class StringConstant:
     @classmethod
@@ -94,7 +112,7 @@ class ScaleBatchPromptSchedule:
     
     RETURN_TYPES = ("STRING",)
     FUNCTION = "scaleschedule"
-    CATEGORY = "KJNodes"
+    CATEGORY = "KJNodes/misc"
     DESCRIPTION = """
 Scales a batch schedule from Fizz' nodes BatchPromptSchedule
 to a different frame count.
@@ -138,7 +156,7 @@ class GetLatentsFromBatchIndexed:
     
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "indexedlatentsfrombatch"
-    CATEGORY = "KJNodes"
+    CATEGORY = "KJNodes/latents"
     DESCRIPTION = """
 Selects and returns the latents at the specified indices as an latent batch.
 """
@@ -149,10 +167,11 @@ Selects and returns the latents at the specified indices as an latent batch.
             "required": {
                  "latents": ("LATENT",),
                  "indexes": ("STRING", {"default": "0, 1, 2", "multiline": True}),
+                 "latent_format": (["BCHW", "BTCHW", "BCTHW"], {"default": "BCHW"}),
         },
     } 
     
-    def indexedlatentsfrombatch(self, latents, indexes):
+    def indexedlatentsfrombatch(self, latents, indexes, latent_format):
         
         samples = latents.copy()
         latent_samples = samples["samples"] 
@@ -164,7 +183,12 @@ Selects and returns the latents at the specified indices as an latent batch.
         indices_tensor = torch.tensor(index_list, dtype=torch.long)
         
         # Select the latents at the specified indices
-        chosen_latents = latent_samples[indices_tensor]
+        if latent_format == "BCHW":
+            chosen_latents = latent_samples[indices_tensor]
+        elif latent_format == "BTCHW":
+            chosen_latents = latent_samples[:, indices_tensor]
+        elif latent_format == "BCTHW":
+            chosen_latents = latent_samples[:, :, indices_tensor]
 
         samples["samples"] = chosen_latents
         return (samples,)
@@ -176,6 +200,7 @@ class ConditioningMultiCombine:
         return {
             "required": {
                 "inputcount": ("INT", {"default": 2, "min": 2, "max": 20, "step": 1}),
+                "operation": (["combine", "concat"], {"default": "combine"}),
                 "conditioning_1": ("CONDITIONING", ),
                 "conditioning_2": ("CONDITIONING", ),
             },
@@ -189,16 +214,42 @@ class ConditioningMultiCombine:
 Combines multiple conditioning nodes into one
 """
 
-    def combine(self, inputcount, **kwargs):
+    def combine(self, inputcount, operation, **kwargs):
         from nodes import ConditioningCombine
+        from nodes import ConditioningConcat
         cond_combine_node = ConditioningCombine()
+        cond_concat_node = ConditioningConcat()
         cond = kwargs["conditioning_1"]
         for c in range(1, inputcount):
             new_cond = kwargs[f"conditioning_{c + 1}"]
-            cond = cond_combine_node.combine(new_cond, cond)[0]
+            if operation == "combine":
+                cond = cond_combine_node.combine(new_cond, cond)[0]
+            elif operation == "concat":
+                cond = cond_concat_node.concat(cond, new_cond)[0]
         return (cond, inputcount,)
 
+class AppendStringsToList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "string1": ("STRING", {"default": '', "forceInput": True}),
+                "string2": ("STRING", {"default": '', "forceInput": True}),
+            }
+        }
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "joinstring"
+    CATEGORY = "KJNodes/text"
 
+    def joinstring(self, string1, string2):
+        if not isinstance(string1, list):
+            string1 = [string1]
+        if not isinstance(string2, list):
+            string2 = [string2]
+        
+        joined_string = string1 + string2
+        return (joined_string, )
+    
 class JoinStrings:
     @classmethod
     def INPUT_TYPES(cls):
@@ -211,7 +262,7 @@ class JoinStrings:
         }
     RETURN_TYPES = ("STRING",)
     FUNCTION = "joinstring"
-    CATEGORY = "KJNodes/constants"
+    CATEGORY = "KJNodes/text"
 
     def joinstring(self, string1, string2, delimiter):
         joined_string = string1 + delimiter + string2
@@ -233,7 +284,7 @@ class JoinStringMulti:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("string",)
     FUNCTION = "combine"
-    CATEGORY = "KJNodes"
+    CATEGORY = "KJNodes/text"
     DESCRIPTION = """
 Creates single string, or a list of strings, from  
 multiple input strings.  
@@ -688,7 +739,7 @@ class EmptyLatentImagePresets:
     RETURN_TYPES = ("LATENT", "INT", "INT")
     RETURN_NAMES = ("Latent", "Width", "Height")
     FUNCTION = "generate"
-    CATEGORY = "KJNodes"
+    CATEGORY = "KJNodes/latents"
 
     def generate(self, dimensions, invert, batch_size):
         from nodes import EmptyLatentImage
@@ -711,8 +762,11 @@ class EmptyLatentImagePresets:
 class EmptyLatentImageCustomPresets:
     @classmethod
     def INPUT_TYPES(cls):
-        with open(os.path.join(script_directory, 'custom_dimensions.json')) as f:
-            dimensions_dict = json.load(f)  
+        try:
+            with open(os.path.join(script_directory, 'custom_dimensions.json')) as f:
+                dimensions_dict = json.load(f)
+        except FileNotFoundError:
+            dimensions_dict = []
         return {
         "required": {
             "dimensions": (
@@ -731,7 +785,7 @@ class EmptyLatentImageCustomPresets:
     RETURN_TYPES = ("LATENT", "INT", "INT")
     RETURN_NAMES = ("Latent", "Width", "Height")
     FUNCTION = "generate"
-    CATEGORY = "KJNodes"
+    CATEGORY = "KJNodes/latents"
     DESCRIPTION = """
 Generates an empty latent image with the specified dimensions.  
 The choices are loaded from 'custom_dimensions.json' in the nodes folder.
@@ -753,20 +807,23 @@ The choices are loaded from 'custom_dimensions.json' in the nodes folder.
 
 class WidgetToString:
     @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("NaN")
+    def IS_CHANGED(cls, id, node_title, any_input, **kwargs):
+        if any_input is not None and (id != 0 or node_title != ""):
+            return float("NaN")
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "id": ("INT", {"default": 0}),
+                "id": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
                 "widget_name": ("STRING", {"multiline": False}),
                 "return_all": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                          "any_input": (any, {}),
                          "node_title": ("STRING", {"multiline": False}),
+                         "allowed_float_decimals": ("INT", {"default": 2, "min": 0, "max": 10, "tooltip": "Number of decimal places to display for float values"}),
+                         
                          },
             "hidden": {"extra_pnginfo": "EXTRA_PNGINFO",
                        "prompt": "PROMPT",
@@ -785,7 +842,7 @@ are manually edited!
 The 'any_input' is required for making sure the node you want the value from exists in the workflow.
 """
 
-    def get_widget_value(self, id, widget_name, extra_pnginfo, prompt, unique_id, return_all=False, any_input=None, node_title=""):
+    def get_widget_value(self, id, widget_name, extra_pnginfo, prompt, unique_id, return_all=False, any_input=None, node_title="", allowed_float_decimals=2):
         workflow = extra_pnginfo["workflow"]
         #print(json.dumps(workflow, indent=4))
         results = []
@@ -833,14 +890,24 @@ The 'any_input' is required for making sure the node you want the value from exi
         values = prompt[str(node_id)]
         if "inputs" in values:
             if return_all:
-                results.append(', '.join(f'{k}: {str(v)}' for k, v in values["inputs"].items()))
+                # Format items based on type
+                formatted_items = []
+                for k, v in values["inputs"].items():
+                    if isinstance(v, float):
+                        item = f"{k}: {v:.{allowed_float_decimals}f}"
+                    else:
+                        item = f"{k}: {str(v)}"
+                    formatted_items.append(item)
+                results.append(', '.join(formatted_items))
             elif widget_name in values["inputs"]:
-                v = str(values["inputs"][widget_name])  # Convert to string here
+                v = values["inputs"][widget_name]
+                if isinstance(v, float):
+                    v = f"{v:.{allowed_float_decimals}f}"
+                else:
+                    v = str(v)
                 return (v, )
             else:
                 raise NameError(f"Widget not found: {node_id}.{widget_name}")
-        if not results:
-            raise NameError(f"Node not found: {node_id}")
         return (', '.join(results).strip(', '), )
 
 class DummyOut:
@@ -951,6 +1018,23 @@ SVD:
         interped_ys = np.exp(new_ys)[::-1].copy()
         interped_ys_tensor = torch.tensor(interped_ys)
         return interped_ys_tensor
+    
+class StringToFloatList:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {
+                     "string" :("STRING", {"default": "1, 2, 3", "multiline": True}),
+                     }
+                }
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("FLOAT",)
+    CATEGORY = "KJNodes/misc"
+    FUNCTION = "createlist"
+
+    def createlist(self, string):
+        float_list = [float(x.strip()) for x in string.split(',')]
+        return (float_list,)
 
  
 class InjectNoiseToLatent:
@@ -975,13 +1059,14 @@ class InjectNoiseToLatent:
     CATEGORY = "KJNodes/noise"
         
     def injectnoise(self, latents, strength, noise, normalize, average, mix_randn_amount=0, seed=None, mask=None):
-        samples = latents.copy()
-        if latents["samples"].shape != noise["samples"].shape:
+        samples = latents["samples"].clone().cpu()
+        noise = noise["samples"].clone().cpu()
+        if samples.shape != samples.shape:
             raise ValueError("InjectNoiseToLatent: Latent and noise must have the same shape")
         if average:
-            noised = (samples["samples"].clone() + noise["samples"].clone()) / 2
+            noised = (samples + noise) / 2
         else:
-            noised = samples["samples"].clone() + noise["samples"].clone() * strength
+            noised = samples + noise * strength
         if normalize:
             noised = noised / noised.std()
         if mask is not None:
@@ -989,14 +1074,14 @@ class InjectNoiseToLatent:
             mask = mask.expand((-1,noised.shape[1],-1,-1))
             if mask.shape[0] < noised.shape[0]:
                 mask = mask.repeat((noised.shape[0] -1) // mask.shape[0] + 1, 1, 1, 1)[:noised.shape[0]]
-            noised = mask * noised + (1-mask) * latents["samples"]
+            noised = mask * noised + (1-mask) * samples
         if mix_randn_amount > 0:
             if seed is not None:
                 generator = torch.manual_seed(seed)
                 rand_noise = torch.randn(noised.size(), dtype=noised.dtype, layout=noised.layout, generator=generator, device="cpu")
                 noised = noised + (mix_randn_amount * rand_noise)
-        samples["samples"] = noised
-        return (samples,)
+        
+        return ({"samples":noised},)
  
 class SoundReactive:
     @classmethod
@@ -1044,15 +1129,12 @@ class GenerateNoise:
             "normalize": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-            "model": ("MODEL", ),
-            "sigmas": ("SIGMAS", ),
-            "latent_channels": (
-            [   '4',
-                '16',
-            ],
-           ),
+                "model": ("MODEL", ),
+                "sigmas": ("SIGMAS", ),
+                "latent_channels": (['4', '16', ],),
+                "shape": (["BCHW", "BCTHW","BTCHW",],),
             }
-            }
+        }
     
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "generatenoise"
@@ -1061,10 +1143,15 @@ class GenerateNoise:
 Generates noise for injection or to be used as empty latents on samplers with add_noise off.
 """
         
-    def generatenoise(self, batch_size, width, height, seed, multiplier, constant_batch_noise, normalize, sigmas=None, model=None, latent_channels=4):
+    def generatenoise(self, batch_size, width, height, seed, multiplier, constant_batch_noise, normalize, sigmas=None, model=None, latent_channels=4, shape="BCHW"):
 
         generator = torch.manual_seed(seed)
-        noise = torch.randn([batch_size, int(latent_channels), height // 8, width // 8], dtype=torch.float32, layout=torch.strided, generator=generator, device="cpu")
+        if shape == "BCHW":
+            noise = torch.randn([batch_size, int(latent_channels), height // 8, width // 8], dtype=torch.float32, layout=torch.strided, generator=generator, device="cpu")
+        elif shape == "BCTHW":
+            noise = torch.randn([1, int(latent_channels), batch_size,height // 8, width // 8], dtype=torch.float32, layout=torch.strided, generator=generator, device="cpu")
+        elif shape == "BTCHW":
+            noise = torch.randn([1, batch_size, int(latent_channels), height // 8, width // 8], dtype=torch.float32, layout=torch.strided, generator=generator, device="cpu")
         if sigmas is not None:
             sigma = sigmas[0] - sigmas[-1]
             sigma /= model.model.latent_format.scale_factor
@@ -1563,6 +1650,7 @@ or a .txt file with RealEstate camera intrinsics and coordinates, in a 3D plot.
         return (tensor_img,)
 
     def extrinsic2pyramid(self, extrinsic, color_map='red', hw_ratio=1/1, base_xval=1, zval=3):
+        import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d.art3d import Poly3DCollection
         vertex_std = np.array([[0, 0, 0, 1],
                             [base_xval, -base_xval * hw_ratio, zval, 1],
@@ -1606,158 +1694,7 @@ or a .txt file with RealEstate camera intrinsics and coordinates, in a 3D plot.
         ret_poses = [transform_matrix @ x for x in ret_poses]
         return np.array(ret_poses, dtype=np.float32)
     
-
-
-class StabilityAPI_SD3:
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"multiline": True}),
-                "n_prompt": ("STRING", {"multiline": True}),
-                "seed": ("INT", {"default": 123,"min": 0, "max": 4294967294, "step": 1}),
-                "model": (
-                [   
-                    'sd3',
-                    'sd3-turbo',
-                ],
-                {
-                "default": 'sd3'
-                 }),
-                 "aspect_ratio": (
-                [   
-                    '1:1',
-                    '16:9',
-                    '21:9',
-                    '2:3',
-                    '3:2',
-                    '4:5',
-                    '5:4',
-                    '9:16',
-                    '9:21',
-                ],
-                {
-                "default": '1:1'
-                }),
-                "output_format": (
-                [   
-                    'png',
-                    'jpeg',
-                ],
-                {
-                "default": 'jpeg'
-                 }),                 
-            },
-            "optional": {
-                "api_key": ("STRING", {"multiline": True}),
-                "image": ("IMAGE",),
-                "img2img_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "disable_metadata": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "apicall"
-
-    CATEGORY = "KJNodes/experimental"
-    DESCRIPTION = """
-## Calls StabilityAI API
-   
-Although you may have multiple keys in your account,  
-you should use the same key for all requests to this API.  
-
-Get your API key here: https://platform.stability.ai/account/keys  
-Recommended to set the key in the config.json -file under this  
-node packs folder.  
-# WARNING:  
-Otherwise the API key may get saved in the image metadata even  
-with "disable_metadata" on if the workflow includes save nodes  
-separate from this node.  
-   
-sd3 requires 6.5 credits per generation  
-sd3-turbo requires 4 credits per generation  
-
-If no image is provided, mode is set to text-to-image  
-
-"""
-
-    def apicall(self, prompt, n_prompt, model, seed, aspect_ratio, output_format, 
-                img2img_strength=0.5, image=None, disable_metadata=True, api_key=""):
-        from comfy.cli_args import args
-        if disable_metadata:
-            args.disable_metadata = True
-        else:
-            args.disable_metadata = False
-        
-        import requests
-        from torchvision import transforms
-        
-        data = {
-                "mode": "text-to-image",
-                "prompt": prompt,
-                "model": model,
-                "seed": seed,
-                "output_format": output_format
-                }
-        
-        if image is not None:
-            image = image.permute(0, 3, 1, 2).squeeze(0)
-            to_pil = transforms.ToPILImage()
-            pil_image = to_pil(image)
-            # Save the PIL Image to a BytesIO object
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format='PNG')
-            buffer.seek(0)
-            files = {"image": ("image.png", buffer, "image/png")}
-           
-            data["mode"] = "image-to-image"
-            data["image"] = pil_image
-            data["strength"] = img2img_strength
-        else:
-            data["aspect_ratio"] = aspect_ratio,
-            files = {"none": ''}
-        
-        if model != "sd3-turbo":
-            data["negative_prompt"] = n_prompt
-
-        headers={
-                "accept": "image/*"
-            }
-        
-        if api_key != "":
-            headers["authorization"] = api_key
-        else:
-            config_file_path = os.path.join(script_directory,"config.json")
-            with open(config_file_path, 'r') as file:
-                config = json.load(file)
-            api_key_from_config = config.get("sai_api_key")
-            headers["authorization"] = api_key_from_config            
-        
-        response = requests.post(
-            f"https://api.stability.ai/v2beta/stable-image/generate/sd3",
-            headers=headers,
-            files = files,
-            data = data,
-        )
-
-        if response.status_code == 200:
-            # Convert the response content to a PIL Image
-            image = Image.open(io.BytesIO(response.content))
-            # Convert the PIL Image to a PyTorch tensor
-            transform = transforms.ToTensor()
-            tensor_image = transform(image)
-            tensor_image = tensor_image.unsqueeze(0)
-            tensor_image = tensor_image.permute(0, 2, 3, 1).cpu().float()
-            return (tensor_image,)
-        else:
-            try:
-                # Attempt to parse the response as JSON
-                error_data = response.json()
-                raise Exception(f"Server error: {error_data}")
-            except json.JSONDecodeError:
-                # If the response is not valid JSON, raise a different exception
-                raise Exception(f"Server error: {response.text}")
+    
             
 class CheckpointPerturbWeights:
 
@@ -1860,7 +1797,7 @@ class FluxBlockLoraSelect:
 
         return {"required": arg_dict}
     
-    RETURN_TYPES = ("SELECTEDBLOCKS", )
+    RETURN_TYPES = ("SELECTEDDITBLOCKS", )
     RETURN_NAMES = ("blocks", )
     OUTPUT_TOOLTIPS = ("The modified diffusion model.",)
     FUNCTION = "load_lora"
@@ -1871,7 +1808,54 @@ class FluxBlockLoraSelect:
     def load_lora(self, **kwargs):
         return (kwargs,)
     
-class FluxBlockLoraLoader:
+class HunyuanVideoBlockLoraSelect:
+    @classmethod
+    def INPUT_TYPES(s):
+        arg_dict = {}
+        argument = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.01})
+
+        for i in range(20):
+            arg_dict["double_blocks.{}.".format(i)] = argument
+
+        for i in range(40):
+            arg_dict["single_blocks.{}.".format(i)] = argument
+
+        return {"required": arg_dict}
+    
+    RETURN_TYPES = ("SELECTEDDITBLOCKS", )
+    RETURN_NAMES = ("blocks", )
+    OUTPUT_TOOLTIPS = ("The modified diffusion model.",)
+    FUNCTION = "load_lora"
+
+    CATEGORY = "KJNodes/experimental"
+    DESCRIPTION = "Select individual block alpha values, value of 0 removes the block altogether"
+
+    def load_lora(self, **kwargs):
+        return (kwargs,)
+
+class Wan21BlockLoraSelect:
+    @classmethod
+    def INPUT_TYPES(s):
+        arg_dict = {}
+        argument = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.01})
+
+        for i in range(40):
+            arg_dict["blocks.{}.".format(i)] = argument
+
+        return {"required": arg_dict}
+    
+    RETURN_TYPES = ("SELECTEDDITBLOCKS", )
+    RETURN_NAMES = ("blocks", )
+    OUTPUT_TOOLTIPS = ("The modified diffusion model.",)
+    FUNCTION = "load_lora"
+
+    CATEGORY = "KJNodes/experimental"
+    DESCRIPTION = "Select individual block alpha values, value of 0 removes the block altogether"
+
+    def load_lora(self, **kwargs):
+        return (kwargs,)
+    
+class DiTBlockLoraLoader:
     def __init__(self):
         self.loaded_lora = None
 
@@ -1885,7 +1869,7 @@ class FluxBlockLoraLoader:
                 "optional": {
                     "lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "The name of the LoRA."}),
                     "opt_lora_path": ("STRING", {"forceInput": True, "tooltip": "Absolute path of the LoRA."}),
-                    "blocks": ("SELECTEDBLOCKS",),
+                    "blocks": ("SELECTEDDITBLOCKS",),
                 }
                }
     
@@ -1896,7 +1880,7 @@ class FluxBlockLoraLoader:
     CATEGORY = "KJNodes/experimental"
 
     def load_lora(self, model, strength_model, lora_name=None, opt_lora_path=None, blocks=None):
-        from comfy.utils import load_torch_file
+        
         import comfy.lora
 
         if opt_lora_path:
@@ -1909,13 +1893,13 @@ class FluxBlockLoraLoader:
             if self.loaded_lora[0] == lora_path:
                 lora = self.loaded_lora[1]
             else:
-                temp = self.loaded_lora
                 self.loaded_lora = None
-                del temp
         
         if lora is None:
             lora = load_torch_file(lora_path, safe_load=True)
-            # Find the first key that ends with "weight"
+            self.loaded_lora = (lora_path, lora)
+
+        # Find the first key that ends with "weight"
         rank = "unknown"
         weight_key = next((key for key in lora.keys() if key.endswith('weight')), None)
         # Print the shape of the value corresponding to the key
@@ -1937,7 +1921,7 @@ class FluxBlockLoraLoader:
             keys_to_delete = []
 
             for block in blocks:
-                for key in list(loaded.keys()):  # Convert keys to a list to avoid runtime error due to size change
+                for key in list(loaded.keys()):
                     match = False
                     if isinstance(key, str) and block in key:
                         match = True
@@ -1950,40 +1934,24 @@ class FluxBlockLoraLoader:
                     if match:
                         ratio = blocks[block]
                         if ratio == 0:
-                            keys_to_delete.append(key)  # Collect keys to delete
+                            keys_to_delete.append(key)
                         else:
-                            value = loaded[key]
-                            if isinstance(value, tuple) and len(value) > 1 and isinstance(value[1], tuple):
-                                # Handle the tuple format
-                                if len(value[1]) > 3:
-                                    loaded[key] = (value[0], value[1][:-3] + (ratio, value[1][-2], value[1][-1]))
-                                else:
-                                    loaded[key] = (value[0], value[1][:-2] + (ratio, value[1][-1]))
-                            else:
-                                # Handle the simpler format directly
-                                loaded[key] = (value[0], ratio)
+                            value = loaded[key].weights
+                            weights_list = list(loaded[key].weights)
+                            weights_list[2] = ratio
+                            loaded[key].weights = tuple(weights_list)
 
-            # Now perform the deletion of keys
             for key in keys_to_delete:
                 del loaded[key]
 
             print("loading lora keys:")
             for key, value in loaded.items():
-                if isinstance(value, tuple) and len(value) > 1 and isinstance(value[1], tuple):
-                    # Handle the tuple format
-                    if len(value[1]) > 2:
-                        alpha = value[1][-3]  # Assuming the alpha value is the third last element in the tuple
-                    else:
-                        alpha = value[1][-2]  # Adjust according to the second format's structure
-                else:
-                    # Handle the simpler format directly
-                    alpha = value[1] if len(value) > 1 else None
-                print(f"Key: {key}, Alpha: {alpha}")
+                print(f"Key: {key}, Alpha: {value.weights[2]}")
 
 
-        if model is not None:
-            new_modelpatcher = model.clone()
-            k = new_modelpatcher.add_patches(loaded, strength_model)  
+                if model is not None:
+                    new_modelpatcher = model.clone()
+                    k = new_modelpatcher.add_patches(loaded, strength_model)  
     
         k = set(k)
         for x in loaded:
@@ -2016,10 +1984,10 @@ class CustomControlNetWeightsFluxFromList:
     def load_weights(self, list_of_floats: list[float],
                      uncond_multiplier: float=1.0, cn_extras: dict[str]={}):
         
-        acn_nodes = importlib.import_module("ComfyUI-Advanced-ControlNet")
-        ControlWeights = acn_nodes.adv_control.utils.ControlWeights
-        TimestepKeyframeGroup = acn_nodes.adv_control.utils.TimestepKeyframeGroup
-        TimestepKeyframe = acn_nodes.adv_control.utils.TimestepKeyframe
+        adv_control = importlib.import_module("ComfyUI-Advanced-ControlNet.adv_control")
+        ControlWeights = adv_control.utils.ControlWeights
+        TimestepKeyframeGroup = adv_control.utils.TimestepKeyframeGroup
+        TimestepKeyframe = adv_control.utils.TimestepKeyframe
 
         weights = ControlWeights.controlnet(weights_input=list_of_floats, uncond_multiplier=uncond_multiplier, extras=cn_extras)
         print(weights.weights_input)
@@ -2056,3 +2024,566 @@ class SetShakkerLabsUnionControlNetType:
             control_net.set_extra_arg("control_type", [])
 
         return (control_net,)
+
+class ModelSaveKJ:
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "model": ("MODEL",),
+                              "filename_prefix": ("STRING", {"default": "diffusion_models/ComfyUI"}),
+                              "model_key_prefix": ("STRING", {"default": "model.diffusion_model."}),
+                              },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},}
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+
+    CATEGORY = "advanced/model_merging"
+
+    def save(self, model, filename_prefix, model_key_prefix, prompt=None, extra_pnginfo=None):
+        from comfy.utils import save_torch_file
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+    
+        output_checkpoint = f"{filename}_{counter:05}_.safetensors"
+        output_checkpoint = os.path.join(full_output_folder, output_checkpoint)
+
+        load_models = [model]
+
+        model_management.load_models_gpu(load_models, force_patch_weights=True)
+        default_prefix = "model.diffusion_model."
+
+        sd = model.model.state_dict_for_saving(None, None, None)
+
+        new_sd = {}
+        for k in sd:
+            if k.startswith(default_prefix):
+                new_key = model_key_prefix + k[len(default_prefix):]
+            else:
+                new_key = k  # In case the key doesn't start with the default prefix, keep it unchanged
+            t = sd[k]
+            if not t.is_contiguous():
+                t = t.contiguous()
+            new_sd[new_key] = t
+        print(full_output_folder)
+        if not os.path.exists(full_output_folder):
+            os.makedirs(full_output_folder)
+        save_torch_file(new_sd, os.path.join(full_output_folder, output_checkpoint))
+        return {}
+       
+class StyleModelApplyAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning": ("CONDITIONING", ),
+                             "style_model": ("STYLE_MODEL", ),
+                             "clip_vision_output": ("CLIP_VISION_OUTPUT", ),
+                             "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.001}),
+                             }}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "apply_stylemodel"
+    CATEGORY = "KJNodes/experimental"
+    DESCRIPTION = "StyleModelApply but with strength parameter"
+
+    def apply_stylemodel(self, clip_vision_output, style_model, conditioning, strength=1.0):
+        cond = style_model.get_cond(clip_vision_output).flatten(start_dim=0, end_dim=1).unsqueeze(dim=0)
+        cond = strength * cond
+        c = []
+        for t in conditioning:
+            n = [torch.cat((t[0], cond), dim=1), t[1].copy()]
+            c.append(n)
+        return (c, )
+
+class AudioConcatenate:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "audio1": ("AUDIO",),
+            "audio2": ("AUDIO",),
+            "direction": (
+            [   'right',
+                'left',
+            ],
+            {
+            "default": 'right'
+             }),
+        }}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "concanate"
+    CATEGORY = "KJNodes/audio"
+    DESCRIPTION = """
+Concatenates the audio1 to audio2 in the specified direction.
+"""
+
+    def concanate(self, audio1, audio2, direction):
+        sample_rate_1 = audio1["sample_rate"]
+        sample_rate_2 = audio2["sample_rate"]
+        if sample_rate_1 != sample_rate_2:
+            raise Exception("Sample rates of the two audios do not match")
+        
+        waveform_1 = audio1["waveform"]
+        print(waveform_1.shape)
+        waveform_2 = audio2["waveform"]
+
+        # Concatenate based on the specified direction
+        if direction == 'right':
+            concatenated_audio = torch.cat((waveform_1, waveform_2), dim=2)  # Concatenate along width
+        elif direction == 'left':
+            concatenated_audio= torch.cat((waveform_2, waveform_1), dim=2)  # Concatenate along width
+        return ({"waveform": concatenated_audio, "sample_rate": sample_rate_1},)
+
+class LeapfusionHunyuanI2V:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "latent": ("LATENT",),
+                "index": ("INT", {"default": 0, "min": -1, "max": 1000, "step": 1,"tooltip": "The index of the latent to be replaced. 0 for first frame and -1 for last"}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The start percentage of steps to apply"}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The end percentage of steps to apply"}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.001}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+
+    CATEGORY = "KJNodes/experimental"
+
+    def patch(self, model, latent, index, strength, start_percent, end_percent):
+
+        def outer_wrapper(samples, index, start_percent, end_percent):
+            def unet_wrapper(apply_model, args):
+                steps = args["c"]["transformer_options"]["sample_sigmas"]
+                inp, timestep, c = args["input"], args["timestep"], args["c"]
+                matched_step_index = (steps == timestep).nonzero()
+                if len(matched_step_index) > 0:
+                    current_step_index = matched_step_index.item()
+                else:
+                    for i in range(len(steps) - 1):
+                        # walk from beginning of steps until crossing the timestep
+                        if (steps[i] - timestep[0]) * (steps[i + 1] - timestep[0]) <= 0:
+                            current_step_index = i
+                            break
+                    else:
+                        current_step_index = 0
+                current_percent = current_step_index / (len(steps) - 1)
+                if samples is not None:
+                    if start_percent <= current_percent <= end_percent:
+                        inp[:, :, [index], :, :] = samples[:, :, [0], :, :].to(inp)
+                    else:
+                        inp[:, :, [index], :, :] = torch.zeros(1)
+                return apply_model(inp, timestep, **c)
+            return unet_wrapper
+        
+        samples = latent["samples"] * 0.476986 * strength
+        m = model.clone()
+        m.set_model_unet_function_wrapper(outer_wrapper(samples, index, start_percent, end_percent))
+
+        return (m,)
+
+class ImageNoiseAugmentation:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "noise_aug_strength": ("FLOAT", {"default": None, "min": 0.0, "max": 100.0, "step": 0.001}),
+                "seed": ("INT", {"default": 123,"min": 0, "max": 0xffffffffffffffff, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "add_noise"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+    Add noise to an image.  
+    """
+
+    def add_noise(self, image, noise_aug_strength, seed):
+        torch.manual_seed(seed)
+        sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * noise_aug_strength
+        image_noise = torch.randn_like(image) * sigma[:, None, None, None]
+        image_noise = torch.where(image==-1, torch.zeros_like(image), image_noise)
+        image_out = image + image_noise
+        return image_out,
+
+class VAELoaderKJ:
+    @staticmethod
+    def vae_list():
+        vaes = folder_paths.get_filename_list("vae")
+        approx_vaes = folder_paths.get_filename_list("vae_approx")
+        sdxl_taesd_enc = False
+        sdxl_taesd_dec = False
+        sd1_taesd_enc = False
+        sd1_taesd_dec = False
+        sd3_taesd_enc = False
+        sd3_taesd_dec = False
+        f1_taesd_enc = False
+        f1_taesd_dec = False
+
+        for v in approx_vaes:
+            if v.startswith("taesd_decoder."):
+                sd1_taesd_dec = True
+            elif v.startswith("taesd_encoder."):
+                sd1_taesd_enc = True
+            elif v.startswith("taesdxl_decoder."):
+                sdxl_taesd_dec = True
+            elif v.startswith("taesdxl_encoder."):
+                sdxl_taesd_enc = True
+            elif v.startswith("taesd3_decoder."):
+                sd3_taesd_dec = True
+            elif v.startswith("taesd3_encoder."):
+                sd3_taesd_enc = True
+            elif v.startswith("taef1_encoder."):
+                f1_taesd_dec = True
+            elif v.startswith("taef1_decoder."):
+                f1_taesd_enc = True
+        if sd1_taesd_dec and sd1_taesd_enc:
+            vaes.append("taesd")
+        if sdxl_taesd_dec and sdxl_taesd_enc:
+            vaes.append("taesdxl")
+        if sd3_taesd_dec and sd3_taesd_enc:
+            vaes.append("taesd3")
+        if f1_taesd_dec and f1_taesd_enc:
+            vaes.append("taef1")
+        return vaes
+
+    @staticmethod
+    def load_taesd(name):
+        sd = {}
+        approx_vaes = folder_paths.get_filename_list("vae_approx")
+
+        encoder = next(filter(lambda a: a.startswith("{}_encoder.".format(name)), approx_vaes))
+        decoder = next(filter(lambda a: a.startswith("{}_decoder.".format(name)), approx_vaes))
+
+        enc = load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", encoder))
+        for k in enc:
+            sd["taesd_encoder.{}".format(k)] = enc[k]
+
+        dec = load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", decoder))
+        for k in dec:
+            sd["taesd_decoder.{}".format(k)] = dec[k]
+
+        if name == "taesd":
+            sd["vae_scale"] = torch.tensor(0.18215)
+            sd["vae_shift"] = torch.tensor(0.0)
+        elif name == "taesdxl":
+            sd["vae_scale"] = torch.tensor(0.13025)
+            sd["vae_shift"] = torch.tensor(0.0)
+        elif name == "taesd3":
+            sd["vae_scale"] = torch.tensor(1.5305)
+            sd["vae_shift"] = torch.tensor(0.0609)
+        elif name == "taef1":
+            sd["vae_scale"] = torch.tensor(0.3611)
+            sd["vae_shift"] = torch.tensor(0.1159)
+        return sd
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": { "vae_name": (s.vae_list(), ),
+                          "device": (["main_device", "cpu"],),
+                          "weight_dtype": (["bf16", "fp16", "fp32" ],),
+                         }
+            }
+        
+    RETURN_TYPES = ("VAE",)
+    FUNCTION = "load_vae"
+    CATEGORY = "KJNodes/vae"
+
+    def load_vae(self, vae_name, device, weight_dtype):
+        from comfy.sd import VAE
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[weight_dtype]
+        if device == "main_device":
+            device = model_management.get_torch_device()
+        elif device == "cpu":
+            device = torch.device("cpu")
+        if vae_name in ["taesd", "taesdxl", "taesd3", "taef1"]:
+            sd = self.load_taesd(vae_name)
+        else:
+            vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+            sd = load_torch_file(vae_path)
+        vae = VAE(sd=sd, device=device, dtype=dtype)
+        return (vae,)
+
+from comfy.samplers import sampling_function, CFGGuider
+class Guider_ScheduledCFG(CFGGuider):
+
+    def set_cfg(self, cfg, start_percent, end_percent):
+        self.cfg = cfg
+        self.start_percent = start_percent
+        self.end_percent = end_percent
+
+    def predict_noise(self, x, timestep, model_options={}, seed=None):
+        steps = model_options["transformer_options"]["sample_sigmas"]
+        matched_step_index = (steps == timestep).nonzero()
+        assert not (isinstance(self.cfg, list) and len(self.cfg) != (len(steps) - 1)), "cfg list length must match step count"
+        if len(matched_step_index) > 0:
+            current_step_index = matched_step_index.item()
+        else:
+            for i in range(len(steps) - 1):
+                # walk from beginning of steps until crossing the timestep
+                if (steps[i] - timestep[0]) * (steps[i + 1] - timestep[0]) <= 0:
+                    current_step_index = i
+                    break
+            else:
+                current_step_index = 0
+        current_percent = current_step_index / (len(steps) - 1)
+
+        if self.start_percent <= current_percent <= self.end_percent:
+            if isinstance(self.cfg, list):
+                cfg = self.cfg[current_step_index]
+            else:
+                cfg = self.cfg
+            uncond = self.conds.get("negative", None)
+        else:
+            uncond = None
+            cfg = 1.0
+
+        return sampling_function(self.inner_model, x, timestep, uncond, self.conds.get("positive", None), cfg, model_options=model_options, seed=seed)            
+  
+class ScheduledCFGGuidance:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { 
+                    "model": ("MODEL",),
+                    "positive": ("CONDITIONING", ),
+                    "negative": ("CONDITIONING", ),
+                    "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                    "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step":0.01}),
+                    "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step":0.01}),
+                    },
+                }
+    RETURN_TYPES = ("GUIDER",)
+    FUNCTION = "get_guider"
+    CATEGORY = "KJNodes/experimental"
+    DESCRiPTION = """
+CFG Guider that allows for scheduled CFG changes over steps, the steps outside the range will use CFG 1.0 thus being processed faster.  
+cfg input can be a list of floats matching step count, or a single float for all steps.  
+"""
+
+    def get_guider(self, model, cfg, positive, negative, start_percent, end_percent):
+        guider = Guider_ScheduledCFG(model) 
+        guider.set_conds(positive, negative)
+        guider.set_cfg(cfg, start_percent, end_percent)
+        return (guider, )
+    
+
+class ApplyRifleXRoPE_WanVideo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "latent": ("LATENT", {"tooltip": "Only used to get the latent count"}),
+                "k": ("INT", {"default": 6, "min": 1, "max": 100, "step": 1, "tooltip": "Index of intrinsic frequency"}),
+            } 
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "KJNodes/experimental"
+    EXPERIMENTAL = True
+    DESCRIPTION = "Extends the potential frame count of HunyuanVideo using this method: https://github.com/thu-ml/RIFLEx"
+
+    def patch(self, model, latent, k):
+        model_class = model.model.diffusion_model
+        
+        model_clone = model.clone()
+        num_frames = latent["samples"].shape[2]
+        d = model_class.dim // model_class.num_heads
+
+        rope_embedder = EmbedND_RifleX(
+            d, 
+            10000.0, 
+            [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)],
+            num_frames,
+            k
+            )
+        
+        model_clone.add_object_patch(f"diffusion_model.rope_embedder", rope_embedder)
+                    
+        return (model_clone, )
+    
+class ApplyRifleXRoPE_HunuyanVideo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "latent": ("LATENT", {"tooltip": "Only used to get the latent count"}),
+                "k": ("INT", {"default": 4, "min": 1, "max": 100, "step": 1, "tooltip": "Index of intrinsic frequency"}),
+            } 
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "KJNodes/experimental"
+    EXPERIMENTAL = True
+    DESCRIPTION = "Extends the potential frame count of HunyuanVideo using this method: https://github.com/thu-ml/RIFLEx"
+
+    def patch(self, model, latent, k):
+        model_class = model.model.diffusion_model
+        
+        model_clone = model.clone()
+        num_frames = latent["samples"].shape[2]
+
+        pe_embedder = EmbedND_RifleX(
+            model_class.params.hidden_size // model_class.params.num_heads, 
+            model_class.params.theta, 
+            model_class.params.axes_dim, 
+            num_frames,
+            k
+            )
+        
+        model_clone.add_object_patch(f"diffusion_model.pe_embedder", pe_embedder)
+                    
+        return (model_clone, )
+
+def rope_riflex(pos, dim, theta, L_test, k):
+    from einops import rearrange
+    assert dim % 2 == 0
+    if model_management.is_device_mps(pos.device) or model_management.is_intel_xpu() or model_management.is_directml_enabled():
+        device = torch.device("cpu")
+    else:
+        device = pos.device
+
+    scale = torch.linspace(0, (dim - 2) / dim, steps=dim//2, dtype=torch.float64, device=device)
+    omega = 1.0 / (theta**scale)
+
+    # RIFLEX modification - adjust last frequency component if L_test and k are provided
+    if k and L_test:
+        omega[k-1] = 0.9 * 2 * torch.pi / L_test
+
+    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.to(dtype=torch.float32, device=pos.device)
+
+class EmbedND_RifleX(nn.Module):
+    def __init__(self, dim, theta, axes_dim, num_frames, k):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.axes_dim = axes_dim
+        self.num_frames = num_frames
+        self.k = k
+
+    def forward(self, ids):
+        n_axes = ids.shape[-1]
+        emb = torch.cat(
+            [rope_riflex(ids[..., i], self.axes_dim[i], self.theta, self.num_frames, self.k if i == 0 else 0) for i in range(n_axes)],
+            dim=-3,
+        )
+        return emb.unsqueeze(1)
+
+
+class Timer:
+    def __init__(self, name):
+        self.name = name
+        self.start_time = None
+        self.elapsed = 0
+
+class TimerNodeKJ:
+    @classmethod
+    
+    def INPUT_TYPES(s):
+      return {
+        "required": {
+            "any_input": (any, {}),
+            "mode": (["start", "stop"],),
+            "name": ("STRING", {"default": "Timer"}),
+        },
+        "optional": {
+            "timer": ("TIMER",),
+        },
+	}
+
+    RETURN_TYPES = (any, "TIMER", "INT", )
+    RETURN_NAMES = ("any_output", "timer", "time")
+    FUNCTION = "timer"
+    CATEGORY = "KJNodes/misc"
+
+    def timer(self, mode, name, any_input=None, timer=None):
+        if timer is None:
+            if mode == "start":
+                timer = Timer(name=name)            
+                timer.start_time = time.time()
+                return {"ui": {
+                "text": [f"{timer.start_time}"]}, 
+                "result": (any_input, timer, 0) 
+                 }
+        elif mode == "stop" and timer is not None:
+            end_time = time.time()
+            timer.elapsed = int((end_time - timer.start_time) * 1000)
+            timer.start_time = None
+            return (any_input, timer, timer.elapsed)
+
+class HunyuanVideoEncodeKeyframesToCond:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "model": ("MODEL",),
+                    "positive": ("CONDITIONING", ),
+                    "vae": ("VAE", ),
+                    "start_frame": ("IMAGE", ),
+                    "end_frame": ("IMAGE", ),
+                    "num_frames": ("INT", {"default": 33, "min": 2, "max": 4096, "step": 1}),
+                    "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 64}),
+                    "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
+                    "temporal_size": ("INT", {"default": 64, "min": 8, "max": 4096, "step": 4, "tooltip": "Only used for video VAEs: Amount of frames to encode at a time."}),
+                    "temporal_overlap": ("INT", {"default": 8, "min": 4, "max": 4096, "step": 4, "tooltip": "Only used for video VAEs: Amount of frames to overlap."}),
+                    },
+                    "optional": {
+                        "negative": ("CONDITIONING", ),
+                    }
+                }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING","CONDITIONING","LATENT")
+    RETURN_NAMES = ("model", "positive", "negative", "latent")
+    FUNCTION = "encode"
+
+    CATEGORY = "KJNodes/videomodels"
+
+    def encode(self, model, positive, start_frame, end_frame, num_frames, vae, tile_size, overlap, temporal_size, temporal_overlap, negative=None):
+
+        model_clone = model.clone()
+
+        model_clone.add_object_patch("concat_keys", ("concat_image",))
+
+       
+        x = (start_frame.shape[1] // 8) * 8
+        y = (start_frame.shape[2] // 8) * 8
+
+        if start_frame.shape[1] != x or start_frame.shape[2] != y:
+            x_offset = (start_frame.shape[1] % 8) // 2
+            y_offset = (start_frame.shape[2] % 8) // 2
+            start_frame = start_frame[:,x_offset:x + x_offset, y_offset:y + y_offset,:]
+        if end_frame.shape[1] != x or end_frame.shape[2] != y:
+            x_offset = (start_frame.shape[1] % 8) // 2
+            y_offset = (start_frame.shape[2] % 8) // 2
+            end_frame = end_frame[:,x_offset:x + x_offset, y_offset:y + y_offset,:]
+
+        video_frames = torch.zeros(num_frames-2, start_frame.shape[1], start_frame.shape[2], start_frame.shape[3], device=start_frame.device, dtype=start_frame.dtype)
+        video_frames = torch.cat([start_frame, video_frames, end_frame], dim=0)
+
+        concat_latent = vae.encode_tiled(video_frames[:,:,:,:3], tile_x=tile_size, tile_y=tile_size, overlap=overlap, tile_t=temporal_size, overlap_t=temporal_overlap)
+
+        out_latent = {}
+        out_latent["samples"] = torch.zeros_like(concat_latent)
+
+        out = []
+        for conditioning in [positive, negative if negative is not None else []]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+                d["concat_latent_image"] = concat_latent
+                n = [t[0], d]
+                c.append(n)
+            out.append(c)
+        if len(out) == 1:
+            out.append(out[0])
+        return (model_clone, out[0], out[1], out_latent)      

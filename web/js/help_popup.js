@@ -45,14 +45,14 @@ export const loadScript = async (FILE_URL) => {
   }
 };
 
-loadScript('/kjweb_async/marked.min.js').catch((e) => {
+loadScript('kjweb_async/marked.min.js').catch((e) => {
   console.log(e)
 })
-loadScript('/kjweb_async/purify.min.js').catch((e) => {
+loadScript('kjweb_async/purify.min.js').catch((e) => {
   console.log(e)
 })
 
-const categories = ["KJNodes", "SUPIR", "VoiceCraft", "Marigold", "IC-Light"];
+const categories = ["KJNodes", "SUPIR", "VoiceCraft", "Marigold", "IC-Light", "WanVideoWrapper"];
 app.registerExtension({
 	name: "KJNodes.HelpPopup",
 	async beforeRegisterNodeDef(nodeType, nodeData) {

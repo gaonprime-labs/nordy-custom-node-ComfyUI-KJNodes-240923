@@ -1520,7 +1520,6 @@ class DrawMaskOnImage:
                     "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values (0-255) or RGBA (0-255). Ex: 255, 0, 0, 128"}),
                   }
                 }
-        }
 
     RETURN_TYPES = ("IMAGE", )
     RETURN_NAMES = ("images",)
